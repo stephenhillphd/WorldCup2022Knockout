@@ -1,0 +1,724 @@
+---
+title: "WC2022 Analysis"
+format: html
+editor: visual
+---
+
+# World Cup 2022 Prediction Model Development
+
+```{r}
+#| include: false
+library(tidyverse)
+library(tidymodels)
+library(skimr)
+library(EloRating)
+library(gt)
+library(gtExtras)
+```
+
+## Methodology
+
+This work is inspired and motivated by work from [Luke Benz](https://lukebenz.com/post/wc_model_methodology/blogpost/) ([\@recspecs730](https://twitter.com/recspecs730) on Twitter) and [David Sheehan](https://dashee87.github.io/data%20science/football/r/predicting-football-results-with-statistical-modelling/).
+
+We need team overall strength ratings, offense ratings, and defense ratings.
+
+## Data
+
+The dataset for this work comes from [Kaggle](https://www.kaggle.com/datasets/martj42/international-football-results-from-1872-to-2017) and includes match scores for matches from 1872 until the end of September 2022.
+
+```{r}
+scores = read_csv("results.csv")
+```
+
+Remove the game from 30 September 2022 as the scores are missing.
+
+```{r}
+scores = scores %>% filter(!is.na(home_score))
+```
+
+## Workflow
+
+### Building an Elo Ratings Model
+
+Let's start by using the "EloRating" package to build an Elo model for all teams using all of the scores for all of the teams since the beginning of qualification for the 2014 World Cup.
+
+```{r}
+scores = scores %>% filter(date >= "2011-06-15")
+```
+
+Need a column for winner and loser. Create these new variables.
+
+Also need a Draw (TRUE or FALSE) column. There will still be a value in the "winner" column.
+
+```{r}
+scores = scores %>% mutate(winner = case_when(
+  home_score > away_score ~ home_team,
+  home_score < away_score ~ away_team,
+  home_score == away_score ~ home_team)
+)
+
+scores = scores %>% mutate(loser = case_when(
+  home_score > away_score ~ away_team,
+  home_score < away_score ~ home_team,
+  home_score == away_score ~ away_team)
+)
+
+scores = scores %>% mutate(Draw = case_when(
+  home_score != away_score ~ "FALSE",
+  home_score == away_score ~ "TRUE")
+)
+```
+
+Remove teams that did not play "enough" games.
+
+```{r}
+scores = scores %>% 
+  group_by(home_team) %>% 
+  filter(n() >= 25) %>% ungroup()
+
+scores = scores %>% 
+  group_by(away_team) %>% 
+  filter(n() >= 25) %>% ungroup()
+```
+
+Data check for EloRatings package.
+
+```{r}
+seqcheck(winner = scores$winner, loser = scores$loser, Date = scores$date)
+```
+
+```{r}
+res = elo.seq(winner = scores$winner, loser = scores$loser, Date = scores$date, draw = scores$Draw, runcheck = TRUE)
+summary(res)
+
+```
+
+Extract the Elo ratings. Examine the ratings first.
+
+```{r}
+extract_elo(res)
+```
+
+Preserve the final (current) Elo ratings
+
+```{r}
+current_elo = as.data.frame(extract_elo(res)) %>%
+  rownames_to_column(var = "team")
+```
+
+```{r}
+current_elo %>% head(10) %>% gt() %>% 
+  cols_align(
+    align = c("center"),
+    columns = c(team,`extract_elo(res)`)
+  ) %>%
+  cols_label(
+    team = md("**Team**"),
+    `extract_elo(res)` = md("**Elo Rating**")
+  ) %>% gtsave("elo_top10.png")
+```
+
+```{r}
+#extract the matrix of ratings
+#logtable contains the ratings before and after the match for each
+#team in the match
+#logtable matches up (in order) with the scores data frame so we should be
+#able to simply row_bind
+elo_ranks = as_tibble(res$logtable)
+```
+
+Bind
+
+```{r}
+scores_elo = bind_cols(scores,elo_ranks)
+```
+
+Examine the dataset before proceeding.
+
+```{r}
+head(scores_elo)
+```
+
+```{r}
+goals = scores_elo %>% select(home_score,away_score) %>% stack(.)
+```
+
+```{r}
+ggplot(goals,aes(x=values)) + geom_bar()
+```
+
+### +Prepare Data for Poisson Regression
+
+Clean-up
+
+```{r}
+scores_elo = scores_elo %>% select(-Date,-`winner...14`,-`loser...15`) %>%
+  rename("winner" = `winner...10`) %>% rename("loser" = `loser...11`)
+scores_elo = scores_elo %>% rename("Win_Elo_Post" = `Apost`) %>% 
+  rename("Lose_Elo_Post" = `Bpost`) %>% select(-Apre,-Bpre)
+```
+
+Filter to beginning of qualifying for 2018 World Cup. We'll use these matches and corresponding ratings in our Poisson regression model.
+
+```{r}
+scores_elo = scores_elo %>% filter(date >= "2015-03-12")
+```
+
+Set-up tournament types (as per Benz)
+
+```{r}
+scores_elo = scores_elo %>% mutate(tourney_type = case_when(
+  tournament == "FIFA World Cup" ~ "WC",
+  tournament %in% c("AFC Asian Cup qualification",
+                    "African Cup of Nations qualification",
+                    "African Nations Championship qualification",
+                    "Arab Cup qualification",
+                    "CFU Caribbean Cup qualification",
+                    "CONCACAF Nations League qualification",
+                    "Copa América qualification",
+                    "FIFA World Cup qualification",
+                    "Gold Cup qualification",
+                    "UEFA Euro qualification") ~ "CCQ/WCQ",
+  tournament %in% c("AFC Asian Cup",
+                    "African Cup of Nations",
+                    "African Nations Championship",
+                    "CFU Caribbean Cup",
+                    "CONCACAF Nations League",
+                    "Confederations Cup",
+                    "Copa América",
+                    "Gold Cup",
+                    "UEFA Euro",
+                    "UEFA Nations League") ~ "CC/CFC",
+  TRUE ~ "F/OM"))
+
+scores_elo = scores_elo %>% mutate(weight = case_when(
+  tourney_type == "F/OM" ~ 1,
+  tourney_type == "CCQ/WCQ" ~ 3,
+  tourney_type == "CC/CFC" ~ 5,
+  tourney_type == "WC" ~ 8
+))
+```
+
+Re-state data as team and opponent. Prepare to re-do flipping team and opponent. Set "team" as the home team here with opponent as the away team. Also set Elo for team and for opponent. Also set-up tournament types.
+
+```{r}
+scores_elo = scores_elo %>% mutate(team = home_team) %>%
+  mutate(opponent = away_team) %>%
+  mutate(team_goals = home_score) %>%
+  mutate(location = case_when(
+    neutral == TRUE ~ "neutral",
+    TRUE ~ "home")) %>%
+  mutate(team_elo = case_when(
+    winner == home_team ~ Win_Elo_Post,
+    TRUE ~ Lose_Elo_Post)) %>%
+  mutate(opp_elo = case_when(
+    loser == home_team ~ Win_Elo_Post,
+    TRUE ~ Lose_Elo_Post))
+```
+
+Create copy from opponent's perspective
+
+```{r}
+scores_elo_copy = scores_elo %>% mutate(team = away_team) %>%
+  mutate(opponent = home_team) %>%
+  mutate(team_goals = away_score) %>%
+  mutate(location = case_when(
+    neutral == TRUE ~ "neutral",
+    TRUE ~ "away")) %>%
+  mutate(team_elo = case_when(
+    winner == away_team ~ Win_Elo_Post,
+    TRUE ~ Lose_Elo_Post)) %>%
+  mutate(opp_elo = case_when(
+    loser == away_team ~ Win_Elo_Post,
+    TRUE ~ Lose_Elo_Post))
+```
+
+```{r}
+head(scores_elo_copy)
+```
+
+```{r}
+final = bind_rows(scores_elo,scores_elo_copy) %>% 
+  select(date, team_goals, team, opponent,location, team_elo,opp_elo, weight )
+```
+
+```{r}
+head(final)
+```
+
+### Building Poisson Regression Model
+
+Build model with all teams. Incorporate team and opponent ratings, location, and elo ratings of both teams.
+
+```{r}
+poisson_reg = glm(team_goals ~ team + opponent + location + team_elo + opp_elo, 
+                  family = "poisson",
+                  data = final, 
+                  weights = weight)
+```
+
+```{r}
+model_estimates = tidy(poisson_reg)
+```
+
+Test prediction for USA vs Brazil
+
+```{r}
+test_df = 
+  data.frame(team = "United States", opponent = "Netherlands", location = "neutral",
+                    team_elo = 1299, opp_elo = 1559)
+predict(poisson_reg,test_df,type = "response")
+```
+
+See probabilities for various numbers of goals.
+
+```{r}
+options(scipen=999)
+dpois(0:5, lambda = 0.5126494 )
+```
+
+```{r}
+test_df = 
+  data.frame(team = "Netherlands", opponent = "United States", location = "neutral",
+                    team_elo = 1559, opp_elo = 1299)
+predict(poisson_reg,test_df,type = "response")
+```
+
+```{r}
+options(scipen=999)
+dpois(0:5, lambda = 2.499133)
+```
+
+### Using the Poisson Model for Predicting World Cup Match Scores
+
+Need a fixtures list in a data frame with the following variables:
+
+-   Team
+
+-   Opponent
+
+-   Location (all are neutral)
+
+-   Team Elo
+
+-   Opponent Elo
+
+Needs to be in both directions (team vs opponent). This will predict the lambda value for each team in the match.
+
+This does not need to be part of the simulation process. Once we generate the team lambdas for each match we can just use those lambdas over and over again.
+
+Read Round of 16 matches from "KO_fixtures.csv"
+
+```{r}
+KO_fixtures = read_csv("KO_fixtures.csv")
+```
+
+Create data frame with all possible KO team combinations.
+
+```{r}
+all_KO_fixtures = KO_fixtures %>% expand(team,opponent) %>%
+  filter(team != opponent)
+```
+
+Add Elo ratings
+
+```{r}
+all_KO_fixtures = inner_join(all_KO_fixtures, current_elo, by="team")
+all_KO_fixtures = inner_join(all_KO_fixtures, current_elo, by=c("opponent"="team"))
+
+all_KO_fixtures = all_KO_fixtures %>% rename("team_elo" = "extract_elo(res).x") %>%
+  rename("opp_elo" = "extract_elo(res).y") %>% mutate(location = "neutral")
+```
+
+Predict lambdas for each team in each possible combination
+
+```{r}
+pred_lambda = predict(poisson_reg,all_KO_fixtures,type = "response")
+```
+
+```{r}
+all_KO_fixtures = all_KO_fixtures %>% mutate(lambda = pred_lambda)
+```
+
+Read-in fixtures for simulation
+
+```{r}
+fixtures_sim = read_csv("fixtures_for_sim.csv")
+```
+
+Add team1 and team2 lambda values from all_KO_fixtures data frame.
+
+```{r}
+test = left_join(fixtures_sim, all_KO_fixtures, by=c('team1'='team', 'team2'='opponent'))
+test = left_join(test, all_KO_fixtures, by=c('team2'='team', 'team1'='opponent'))
+```
+
+```{r}
+test = test %>% select(team1, team2, lambda.x, lambda.y) %>% 
+  rename("lambda1" = "lambda.x", "lambda2" = "lambda.y")
+```
+
+### Round of 16 Sims
+
+Build a simple function to determine match winner.
+
+```{r}
+#match simulation function
+match_sim_KO = function(team1,team2,lambda1,lambda2){
+  
+  goals1 = rpois(1,lambda1)
+  goals2 = rpois(1,lambda2)
+  
+  PK_rand = runif(1,0,1) #for use if tied
+  
+  winner = case_when(
+    goals1 > goals2 ~ team1,
+    goals2 > goals1 ~ team2,
+    goals1 == goals2 & PK_rand >= 0.5 ~ team1, #if tied
+    goals1 == goals2 & PK_rand < 0.5 ~ team2
+    )
+
+  return(winner)
+}
+```
+
+Build a simple function to look-up lambda values
+
+```{r}
+#returns lambda for team1
+lambda_lookup = function(team1,team2){
+  
+    lambda = filter(all_KO_fixtures, team == team1 & opponent == team2) %>% select(lambda)
+
+  return(as.numeric(lambda))
+}
+```
+
+Simulate R16 Games
+
+```{r}
+#set number of simulations
+nsims = 1000
+
+#Create data frames to hold results
+#Each data frame corresponds to a Quarterfinal match
+QF1 = data.frame(matrix(ncol = 2, nrow = nsims))
+QF2 = data.frame(matrix(ncol = 2, nrow = nsims))
+QF3 = data.frame(matrix(ncol = 2, nrow = nsims))
+QF4 = data.frame(matrix(ncol = 2, nrow = nsims))
+
+#provide column names for these new data frames
+colnames(QF1) <- c("team1","team2")
+colnames(QF2) <- c("team1","team2")
+colnames(QF3) <- c("team1","team2")
+colnames(QF4) <- c("team1","team2")
+
+#Netherlands/USA (feeds to QF1)
+team1 = "Netherlands"
+team2 = "United States"
+lambda1 = lambda_lookup(team1,team2)
+lambda2 = lambda_lookup(team2,team1)
+
+for(i in 1:nsims){
+  QF1[i,1] = match_sim_KO(team1,team2,lambda1,lambda2)
+}
+
+#Argentina/Australia (feeds to QF1)
+team1 = "Argentina"
+team2 = "Australia"
+lambda1 = lambda_lookup(team1,team2)
+lambda2 = lambda_lookup(team2,team1)
+
+for(i in 1:nsims){
+  QF1[i,2] = match_sim_KO(team1,team2,lambda1,lambda2)
+}
+
+#Japan/Croatia (feeds to QF2)
+team1 = "Japan"
+team2 = "Croatia"
+lambda1 = lambda_lookup(team1,team2)
+lambda2 = lambda_lookup(team2,team1)
+
+for(i in 1:nsims){
+  QF2[i,1] = match_sim_KO(team1,team2,lambda1,lambda2)
+}
+
+#Brazil/South Korea (feeds to QF2)
+team1 = "Brazil"
+team2 = "South Korea"
+lambda1 = lambda_lookup(team1,team2)
+lambda2 = lambda_lookup(team2,team1)
+
+for(i in 1:nsims){
+  QF2[i,2] = match_sim_KO(team1,team2,lambda1,lambda2)
+}
+
+#Senegal/England (feeds to QF3)
+team1 = "Senegal"
+team2 = "England"
+lambda1 = lambda_lookup(team1,team2)
+lambda2 = lambda_lookup(team2,team1)
+
+for(i in 1:nsims){
+  QF3[i,1] = match_sim_KO(team1,team2,lambda1,lambda2)
+}
+
+#Poland/France (feeds to QF3)
+team1 = "Poland"
+team2 = "France"
+lambda1 = lambda_lookup(team1,team2)
+lambda2 = lambda_lookup(team2,team1)
+
+for(i in 1:nsims){
+  QF3[i,2] = match_sim_KO(team1,team2,lambda1,lambda2)
+}
+
+#Spain/Morocco (feeds to QF4)
+team1 = "Spain"
+team2 = "Morocco"
+lambda1 = lambda_lookup(team1,team2)
+lambda2 = lambda_lookup(team2,team1)
+
+for(i in 1:nsims){
+  QF4[i,1] = match_sim_KO(team1,team2,lambda1,lambda2)
+}
+
+#Switzerland/Portugal (feeds to QF4)
+team1 = "Switzerland"
+team2 = "Portugal"
+lambda1 = lambda_lookup(team1,team2)
+lambda2 = lambda_lookup(team2,team1)
+
+for(i in 1:nsims){
+  QF4[i,2] = match_sim_KO(team1,team2,lambda1,lambda2)
+}
+```
+
+### Quarterfinals
+
+```{r}
+#Create data frames to hold results
+#Each data frame corresponds to a Semifinal match
+SF1 = data.frame(matrix(ncol = 2, nrow = nsims))
+SF2 = data.frame(matrix(ncol = 2, nrow = nsims))
+
+#provide column names for these new data frames
+colnames(SF1) <- c("team1","team2")
+colnames(SF2) <- c("team1","team2")
+
+#QF1 (feeds to SF1)
+for(i in 1:nsims){
+  team1 = QF1[i,1]
+  team2 = QF1[i,2]
+  lambda1 = lambda_lookup(team1,team2)
+  lambda2 = lambda_lookup(team2,team1) 
+  
+  SF1[i,1] = match_sim_KO(team1,team2,lambda1,lambda2)
+}
+
+#QF2 (feeds to SF1)
+for(i in 1:nsims){
+  team1 = QF2[i,1]
+  team2 = QF2[i,2]
+  lambda1 = lambda_lookup(team1,team2)
+  lambda2 = lambda_lookup(team2,team1)  
+  
+  SF1[i,2] = match_sim_KO(team1,team2,lambda1,lambda2)
+}
+
+#QF3 (feeds to SF2)
+for(i in 1:nsims){
+  team1 = QF3[i,1]
+  team2 = QF3[i,2]
+  lambda1 = lambda_lookup(team1,team2)
+  lambda2 = lambda_lookup(team2,team1)  
+  
+  SF2[i,1] = match_sim_KO(team1,team2,lambda1,lambda2)
+}
+
+#QF4 (feeds to SF2)
+for(i in 1:nsims){
+  team1 = QF4[i,1]
+  team2 = QF4[i,2]
+  lambda1 = lambda_lookup(team1,team2)
+  lambda2 = lambda_lookup(team2,team1)  
+  
+  SF2[i,2] = match_sim_KO(team1,team2,lambda1,lambda2)
+}
+```
+
+### Semifinals
+
+```{r}
+#Create data frames to hold results
+Finals = data.frame(matrix(ncol = 2, nrow = nsims))
+
+#provide column names for these new data frames
+colnames(Finals) <- c("team1","team2")
+
+#SF1 
+for(i in 1:nsims){
+  team1 = SF1[i,1]
+  team2 = SF1[i,2]
+  lambda1 = lambda_lookup(team1,team2)
+  lambda2 = lambda_lookup(team2,team1)
+  
+  Finals[i,1] = match_sim_KO(team1,team2,lambda1,lambda2)
+}
+
+#SF2
+for(i in 1:nsims){
+  team1 = SF2[i,1]
+  team2 = SF2[i,2]
+  lambda1 = lambda_lookup(team1,team2)
+  lambda2 = lambda_lookup(team2,team1)  
+  
+  Finals[i,2] = match_sim_KO(team1,team2,lambda1,lambda2)
+}
+```
+
+### Finals
+
+```{r}
+#Create data frames to hold results
+Winner = data.frame(matrix(ncol = 1, nrow = nsims))
+
+#provide column names for these new data frames
+colnames(Winner) <- c("values")
+
+
+for(i in 1:nsims){
+  team1 = Finals[i,1]
+  team2 = Finals[i,2]
+  lambda1 = lambda_lookup(team1,team2)
+  lambda2 = lambda_lookup(team2,team1)  
+  
+  Winner[i,1] = match_sim_KO(team1,team2,lambda1,lambda2)
+}
+```
+
+### Plots
+
+```{r}
+Winner %>% count(values) %>% ggplot(aes(x = reorder(values, n), y = n)) + geom_bar(stat = 'identity') + coord_flip()
+
+ggplot(Finals,aes(x=team1)) + geom_bar() + coord_flip()
+ggplot(Finals,aes(x=team2)) + geom_bar() + coord_flip()
+
+ggplot(SF1,aes(x=team1)) + geom_bar() + coord_flip()
+ggplot(SF1,aes(x=team2)) + geom_bar() + coord_flip()
+
+ggplot(QF1,aes(x=team1)) + geom_bar() + coord_flip()
+ggplot(QF1,aes(x=team2)) + geom_bar() + coord_flip()
+
+```
+
+Clean data
+
+```{r}
+Finals_All = stack(Finals)
+SF1_All = stack(SF1)
+SF2_All = stack(SF2)
+
+SF_All_Teams = bind_rows(SF1_All,SF2_All)
+
+QF1_All = stack(QF1)
+QF2_All = stack(QF2)
+QF3_All = stack(QF3)
+QF4_All = stack(QF4)
+
+QF_All_Teams = bind_rows(QF1_All,QF2_All,QF3_All,QF4_All)
+```
+
+```{r}
+Winner %>% count(values) %>% ggplot(aes(x = reorder(values, n), y = n)) + geom_bar(stat = 'identity') + scale_y_continuous(labels = scales::percent) + xlab("Team") + coord_flip() 
+
+Finals_All %>% count(values) %>% ggplot(aes(x = reorder(values, n), y = n)) + geom_bar(stat = 'identity') + scale_y_continuous(labels = scales::percent) + xlab("Team") + coord_flip() 
+
+SF_All_Teams %>% count(values) %>% ggplot(aes(x = reorder(values, n), y = n)) + geom_bar(stat = 'identity') + scale_y_continuous(labels = scales::percent) + xlab("Team") + coord_flip() 
+
+QF_All_Teams %>% count(values) %>% ggplot(aes(x = reorder(values, n), y = n)) + geom_bar(stat = 'identity') + scale_y_continuous(labels = scales::percent) + xlab("Team") + coord_flip() 
+```
+
+```{r}
+Winner = Winner %>% mutate(Result = "Winner")
+Finals_All = Finals_All %>% mutate(Result = "Finals")
+SF_All_Teams = SF_All_Teams %>% mutate(Result = "Semifinals")
+QF_All_Teams = QF_All_Teams %>% mutate(Result = "Quarterfinals")
+```
+
+```{r}
+All = bind_rows(Winner, Finals_All, SF_All_Teams, QF_All_Teams)
+```
+
+```{r}
+counts = All %>% group_by(Result, values) %>% summarise(n = n())
+```
+
+```{r}
+counts = counts %>% mutate(PctReachStage = 100*n/1000)
+```
+
+```{r}
+pivoted = counts %>% select(-PctReachStage) %>% pivot_wider(names_from = Result, values_from = n) %>%
+  select(values, Quarterfinals, Semifinals, Finals, Winner)
+```
+
+```{r}
+eliminated = pivoted %>% mutate(R16 = 1000 - Quarterfinals) %>% 
+  mutate(QF = 1000-Semifinals-R16) %>%
+  mutate(SF = 1000-Finals-QF-R16) %>%
+  mutate(F = 1000-Winner-SF-QF-R16) %>%
+  mutate(Champion = Winner) %>%
+  select(values,R16,QF,SF,F,Champion)
+```
+
+```{r}
+pivot_elim = eliminated %>% pivot_longer(!values, names_to = "stage", values_to = "count") %>% 
+  mutate(stage = as_factor(stage)) %>% 
+  mutate(stage = fct_relevel(stage, c("Champion","F","SF","QF","R16")))
+```
+
+```{r}
+pivot_elim %>% ggplot(aes(x = values, y = count, fill = stage)) + geom_bar(stat = 'identity') + scale_y_continuous(labels = scales::percent) + xlab("Team") + coord_flip() 
+```
+
+```{r}
+eliminated = eliminated %>% mutate(R16 = R16/1000) %>%
+  mutate(QF = QF/1000) %>% mutate(SF = SF/1000) %>%
+  mutate(F = F/1000) %>% mutate(Champion = Champion/1000) %>%
+  arrange(desc(Champion))
+```
+
+Results summary table
+
+```{r}
+tab1 = eliminated %>% gt() %>% 
+  fmt_percent(
+    columns = c(R16,QF,SF,F,Champion),
+    decimals = 0
+  ) %>% 
+  cols_align(
+    align = c("center"),
+    columns = c(values,R16,QF,SF,F,Champion)
+  ) %>%
+  cols_label(
+    values = md("**Team**"),
+    R16 = md("**Round of 16**"),
+    QF = md("**Quarterfinals**"),
+    SF = md("**Semifinals**"),
+    F = md("**Finals**"),
+    Champion = md("**Champion**")
+  ) %>%
+  # data_color(
+  #   columns = c(`R16`, `QF`,`SF`,`F`,`Champion`),
+  #   colors = scales::col_numeric(
+  #     c("white", "#8A1538"),
+  #       domain = c(0,1)
+  #       ))
+  gt_color_rows(R16:Champion, palette = c("white", "#FF9A9A"))
+```
+
+```{r}
+gtsave(tab1, "results.png")
+```
